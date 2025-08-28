@@ -107,7 +107,7 @@ usar_lluvia_ar <- TRUE  # <— pon FALSE si no quieres correr la sección con ll
 
 ```{r data, message=FALSE, warning=FALSE}
 # Parámetros de entrada
-ruta_xlsx <- "~/Library/Mobile Documents/com~apple~CloudDocs/CCGS/Manuscritos/Guacamayas_Lacandona/Ara_macao/Bases_datos/BASE COMPLETA JUL2023_EMM.xlsx"
+ruta_xlsx <- "~/Library/Mobile Documents/com~apple~CloudDocs/CCGS/Manuscritos/Guacamayas_Lacandona/Ara_Lacandona_git/Bases_datos/BASE COMPLETA JUL2023_EMM.xlsx"
 
 # Usa "BASE FINAL" si existe; si no, la primera hoja
 sheets <- readxl::excel_sheets(ruta_xlsx)
@@ -1024,6 +1024,10 @@ pred1 <- predict(gam_pollos_lag1, newdata = grid_pollos1,
 grid_pollos1 <- grid_pollos1 %>%
   mutate(fit = pred1$fit[,1], se = pred1$se.fit[,1],
          lwr = fit - 1.96*se, upr = fit + 1.96*se)
+
+# Solo calculamos para lag1
+umbral_est_1  <- min(grid_pollos1$n_pollos_lag1[grid_pollos1$fit > 0], na.rm = TRUE)
+umbral_conf_1 <- min(grid_pollos1$n_pollos_lag1[grid_pollos1$lwr > 0], na.rm = TRUE)
 
 # Pasar a escala respuesta
 p0 <- ggplot(grid_pollos0, aes(x = n_pollos, y = fit)) +
