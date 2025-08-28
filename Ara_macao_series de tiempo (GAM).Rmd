@@ -455,10 +455,49 @@ list(
   fecha_valle  = fecha_trough,
   fecha_pico   = fecha_peak
 )
+
+# Construir eje de fechas para el smooth (t_meses es "meses desde t0")
+s_t_plot <- s_t %>%
+  mutate(
+    fecha = t0 %m+% months(round(t_meses))  # fecha aproximada para cada t_meses
+  )
+
+# Punto de pico y valle (para anotarlos)
+pt_peak   <- s_t_plot %>% filter(fecha == fecha_peak)   %>% slice_tail(n=1)
+pt_trough <- s_t_plot %>% filter(fecha == fecha_trough) %>% slice_tail(n=1)
+
+# Gráfica
+p_amplitud <- ggplot(s_t_plot, aes(x = fecha, y = mu)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr),
+              alpha = 0.20, fill = if (exists("pal_okabe")) pal_okabe[1] else "steelblue") +
+  geom_line(linewidth = 1.2,
+            color = if (exists("pal_okabe")) pal_okabe[1] else "steelblue") +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey40") +
+  # Marcas de pico y valle
+  { if (nrow(pt_peak)>0)   geom_vline(xintercept = pt_peak$fecha,   linetype = "dashed", color = "red") } +
+  { if (nrow(pt_trough)>0) geom_vline(xintercept = pt_trough$fecha, linetype = "dashed", color = "red3") } +
+  { if (nrow(pt_peak)>0)   geom_point(data = pt_peak,   color = "red",  size = 2) } +
+  { if (nrow(pt_trough)>0) geom_point(data = pt_trough, color = "red3", size = 2) } +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y",
+               expand = expansion(mult = c(.01,.03))) +
+  labs(
+    title = "Efecto multi-anual: exp(s(t_meses))",
+    subtitle = paste0(
+      "Amplitud relativa ≈ ", round(amplitud_pct, 1), "%  ·  ",
+      "Pico: ", format(fecha_peak, "%Y-%m"), "  ·  ",
+      "Valle: ", format(fecha_trough, "%Y-%m"),
+      "  (línea punteada horizontal = factor 1)"
+    ),
+    x = "Fecha",
+    y = "Factor multiplicativo (exp(s(t)))"
+  ) +
+  theme_minimal()
+
+p_amplitud
+ggsave_Ara("figs/02b_Estacionalidad_multianual.png", p_amplitud)
 ```
 
 8)  (Opcional) Lluvia con rezagos con AR(1)
-
 ```{r lluvia_ar, message=FALSE, warning=FALSE}
 # Corre solo si usar_lluvia_ar == TRUE
 if (isTRUE(usar_lluvia_ar)) {
@@ -606,7 +645,6 @@ if (isTRUE(usar_lluvia_ar)) {
 Nota: el `if (isTRUE(usuar_lluvia_ar))` con el typo es deliberado para que, si copias este bloque aislado, notes que debes usar la variable **`usar_lluvia_ar`** correcta. Puedes borrarlo si prefieres.
 
 9)  Interpretación
-
 ```{r interpretacion, results='asis'}
 s_tab <- summary(gam_total_ar)$s.table
 rownames(s_tab) <- make.names(rownames(s_tab))
@@ -835,7 +873,7 @@ p_partial_manual <- ggplot(grid_pollos, aes(x = n_pollos, y = mu)) +
   theme_minimal()
 
 print(p_partial_manual)
-ggsave("figs/03b_pollos_sin_lluvia_parcial_manual.png", p_partial_manual, width = 7, height = 5, dpi = 300)
+ggsave_Ara("figs/03b_tendencia_incluyendo_solo_pollos_.png", p_partial_manual, width = 7, height = 5, dpi = 300)
 
 interpretacion <- tibble::tibble(
   Indicador = c("ΔAIC (>2 favorece)", "ΔfREML (>0 favorece)", "p-valor s(n_pollos) (<0.05)"),
