@@ -824,11 +824,11 @@ grid_pollos <- grid_pollos %>%
 
 # Graficar efecto parcial
 p_partial_manual <- ggplot(grid_pollos, aes(x = n_pollos, y = mu)) +
-  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.2, fill = "blue") +
-  geom_line(color = "blue", linewidth = 1.2) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.2, fill = "#fb8c27") +
+  geom_line(color = "#fb8c27", linewidth = 1) +
   labs(
     title = "Efecto parcial de pollos rescatados",
-    subtitle = "GAM NegBin sin lluvia, IC 95%",
+    subtitle = "GAM NegBin, IC 95%",
     x = "Pollos rescatados (anual)",
     y = "Efecto estimado sobre el conteo"
   ) +
@@ -891,8 +891,8 @@ cat("Umbral estimado (efecto esperado > 0):", umbral_est, "\n")
 cat("Umbral conservador (IC 95% > 0):", umbral_conservador, "\n")
 
 p_partial_positive<-ggplot(grid_pollos, aes(x = n_pollos, y = fit_link)) +
-  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.2, fill = "blue") +
-  geom_line(color = "blue", size = 1.2) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.2, fill = "#fb8c27") +
+  geom_line(color = "#fb8c27", size = 1) +
   geom_hline(yintercept = 0, linetype = "dashed") +
   geom_vline(xintercept = umbral_est, linetype = "dotted", color = "red") +
   labs(x = "Pollos rescatados (anual)",
@@ -943,8 +943,8 @@ grid_pollos <- grid_pollos %>%
 
 #9. Graficar efecto en escala de conteos
 p_partial_counts <- ggplot(grid_pollos, aes(x = n_pollos, y = mu)) +
-  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.2, fill = "blue") +
-  geom_line(color = "blue", linewidth = 1.2) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.2, fill = "#fb8c27") +
+  geom_line(color = "#fb8c27", linewidth = 1) +
   labs(
     x = "Pollos rescatados (anual)",
     y = "Conteo esperado de individuos/mes",
@@ -1031,15 +1031,15 @@ umbral_conf_1 <- min(grid_pollos1$n_pollos_lag1[grid_pollos1$lwr > 0], na.rm = T
 
 # Pasar a escala respuesta
 p0 <- ggplot(grid_pollos0, aes(x = n_pollos, y = fit)) +
-  geom_ribbon(aes(ymin = lwr, ymax = upr), fill = "blue", alpha = 0.2) +
-  geom_line(color = "blue", linewidth = 1.2) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), fill = "#fb8c27", alpha = 0.2) +
+  geom_line(color = "#fb8c27", linewidth = 0.8) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
-  geom_vline(xintercept = umbral_est, color = "red", linetype = "dashed") +
+  geom_vline(xintercept = umbral_est, color = "red", linetype = "dotted") +
   geom_vline(xintercept = umbral_conservador, color = "darkred", linetype = "dotted") +
   labs(
-    x = "Pollos rescatados (año actual)",
-    y = "Efecto parcial (log-link)",
-    title = "Efecto parcial: n_pollos (año actual, escala log)",
+    x = "Pollos rescatados (año)",
+    y = "Efecto parcial (log)",
+    title = "Efecto parcial pollos rescatados",
     subtitle = paste0("Umbral estimado: ", round(umbral_est,1),
                       " | Umbral IC95%: ", round(umbral_conservador,1))
   ) +
@@ -1047,15 +1047,14 @@ p0 <- ggplot(grid_pollos0, aes(x = n_pollos, y = fit)) +
 
 # --- Gráfico lag 1 (escala log)
 p1 <- ggplot(grid_pollos1, aes(x = n_pollos_lag1, y = fit)) +
-  geom_ribbon(aes(ymin = lwr, ymax = upr), fill = "green", alpha = 0.2) +
-  geom_line(color = "green", linewidth = 1.2) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), fill = "#04cdc1", alpha = 0.2) +
+  geom_line(color = "#04cdc1", linewidth = 0.8) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
-  geom_vline(xintercept = umbral_est_1, color = "red", linetype = "dashed") +
+  geom_vline(xintercept = umbral_est_1, color = "red", linetype = "dotted") +
   geom_vline(xintercept = umbral_conf_1, color = "darkred", linetype = "dotted") +
   labs(
     x = "Pollos rescatados (año anterior)",
-    y = "Efecto parcial (log-link)",
-    title = "Efecto parcial: n_pollos_lag1 (año anterior, escala log)",
+    title = "Efecto parcial pollos lag 1 año",
     subtitle = paste0("Umbral estimado: ", round(umbral_est_1,1),
                       " | Umbral IC95%: ", round(umbral_conf_1,1))
   ) +
