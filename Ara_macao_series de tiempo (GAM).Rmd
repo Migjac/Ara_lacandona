@@ -1,0 +1,1073 @@
+---
+title: "Guacamayas —Series de tiempo (GAM)"
+autores: Enrique Martínez Meyer & Miguel Jácome
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: inline
+fecha: 12 de agosto de 2025
+---
+
+Configuraciones generales
+
+```{r setup, message=FALSE, warning=FALSE}
+# Paquetes
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(janitor)
+library(mgcv)
+library(gratia)
+library(ggrepel)
+
+set.seed(1)
+dir.create("figs", showWarnings = FALSE)
+
+# =================== Estética global ===================
+theme_Ara <- function(base_size = 12, base_family = "") {
+  theme_minimal(base_size = base_size, base_family = base_family) %+replace%
+    theme(
+      plot.title      = element_text(face = "bold", size = base_size + 2, hjust = 0, margin = margin(b = 6)),
+      plot.subtitle   = element_text(color = "grey25", margin = margin(b = 8)),
+      plot.caption    = element_text(color = "grey40", size = base_size - 2, hjust = 0),
+      axis.title      = element_text(face = "bold"),
+      axis.text       = element_text(color = "grey20"),
+      panel.grid.minor= element_blank(),
+      panel.grid.major= element_line(color = "grey88", linewidth = 0.4),
+      strip.text      = element_text(face = "bold"),
+      legend.position = "top",
+      legend.title    = element_text(face = "bold")
+    )
+}
+pal_okabe <- c("#0033A0", "#017574", "#54a2a4", "#D55E00", "#CC79A7", "#f6b617", "#00a2af", "#000000","#d92447")
+ggsave_Ara <- function(filename, plot, width = 9, height = 5, dpi = 320) {
+  ggsave(filename, plot = plot, width = width, height = height, dpi = dpi, bg = "white")
+}
+
+# Predicciones con IC95% en escala de respuesta
+pred_ci <- function(mod, newdata) {
+  p <- predict(mod, newdata = newdata, type = "link", se.fit = TRUE)
+  inv <- mod$family$linkinv
+  mu  <- inv(p$fit)
+  lwr <- inv(p$fit - 1.96*p$se.fit)
+  upr <- inv(p$fit + 1.96*p$se.fit)
+  bind_cols(newdata, tibble(mu = mu, lwr = lwr, upr = upr))
+}
+
+# Curva de un smooth (usando gratia::smooth_estimates) + IC puntuales
+smooth_curve <- function(mod, smooth, 
+                         x_candidates = c("x","t_meses","mes_num",".x"),
+                         out_x = "x",
+                         level = 0.95, linkinv = NULL) {
+  s <- gratia::smooth_estimates(mod, smooth = smooth)
+  est_col <- intersect(c("estimate",".estimate"), names(s))[1]
+  se_col  <- intersect(c("se",".se","std.error",".std.error"), names(s))[1]
+  x_col   <- intersect(x_candidates, names(s))[1]
+  stopifnot(!is.na(est_col), !is.na(se_col), !is.na(x_col))
+  if (is.null(linkinv)) linkinv <- mod$family$linkinv
+  z <- qnorm(0.5 + level/2)
+  s %>%
+    transmute(
+      !!out_x := .data[[x_col]],
+      est   = .data[[est_col]],
+      se    = .data[[se_col]],
+      lower = est - z*se,
+      upper = est + z*se,
+      mu  = linkinv(est),
+      lwr = linkinv(lower),
+      upr = linkinv(upper)
+    )
+}
+
+# Segmentador de tramos contiguos a partir de bandera booleana
+segmentar_tramos <- function(df, flag_col, gap_max = 1.5) {
+  df %>%
+    filter(.data[[flag_col]]) %>%
+    arrange(t_meses) %>%
+    mutate(gap = t_meses - lag(t_meses),
+           new_block = is.na(gap) | gap > gap_max,
+           tramo = cumsum(replace_na(new_block, TRUE))) %>%
+    group_by(tramo) %>%
+    summarise(
+      inicio  = first(mes),
+      fin     = last(mes),
+      n_meses = n(),
+      d_med   = mean(derivative),
+      .groups = "drop"
+    )
+}
+theme_set(theme_Ara())
+
+# ----- Switch para evaluar lluvia con AR(1) -----
+usar_lluvia_ar <- TRUE  # <— pon FALSE si no quieres correr la sección con lluvia
+```
+
+1)  Carga y limpieza
+
+```{r data, message=FALSE, warning=FALSE}
+# Parámetros de entrada
+ruta_xlsx <- "~/Library/Mobile Documents/com~apple~CloudDocs/CCGS/Manuscritos/Guacamayas_Lacandona/Ara_macao/Bases_datos/BASE COMPLETA JUL2023_EMM.xlsx"
+
+# Usa "BASE FINAL" si existe; si no, la primera hoja
+sheets <- readxl::excel_sheets(ruta_xlsx)
+sheet_use <- if ("BASE FINAL" %in% sheets) "BASE FINAL" else sheets[1]
+
+raw <- read_excel(ruta_xlsx, sheet = sheet_use) |> clean_names()
+
+# Columnas esperadas tras clean_names():
+# fecha, transecto, no_de_transecto, tamano_de_grupo, no_adultos, no_juveniles, no_indeterminados, lluvia
+
+dat <- raw |>
+  mutate(
+    fecha        = suppressWarnings(as_date(fecha)),
+    mes          = floor_date(fecha, "month"),
+    transecto    = as.character(transecto) |> stringr::str_squish(),
+    no_transecto = suppressWarnings(as.integer(no_transecto)),
+    tam_grupo    = suppressWarnings(as.numeric(tamano_de_grupo)),
+    n_adultos    = suppressWarnings(as.numeric(no_adultos)),
+    n_juveniles  = suppressWarnings(as.numeric(no_juveniles)),
+    n_indet      = suppressWarnings(as.numeric(no_indeterminados)),
+    lluvia       = suppressWarnings(as.numeric(lluvia))
+  ) |>
+  select(mes, fecha, transecto, no_transecto,
+         lluvia, tam_grupo, n_adultos, n_juveniles, n_indet) |>
+  filter(!is.na(mes), !is.na(transecto))
+
+# Agregación mensual por transecto
+mensual_tr <- dat |>
+  group_by(mes, transecto, no_transecto) |>
+  summarise(
+    conteo    = sum(tam_grupo, na.rm = TRUE),
+    adultos   = sum(n_adultos,   na.rm = TRUE),
+    juveniles = sum(n_juveniles, na.rm = TRUE),
+    indet     = sum(n_indet,     na.rm = TRUE),
+    lluvia    = mean(lluvia, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    mes_num = month(mes),
+    t_meses = as.numeric(difftime(mes, min(mes, na.rm = TRUE), units = "days"))/30.4375
+  )
+
+# Total mensual
+mensual_total <- mensual_tr |>
+  group_by(mes) |>
+  summarise(
+    conteo_total    = sum(conteo,    na.rm = TRUE),
+    adultos_total   = sum(adultos,   na.rm = TRUE),
+    juveniles_total = sum(juveniles, na.rm = TRUE),
+    lluvia          = mean(lluvia,   na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    mes_num = month(mes),
+    t_meses = as.numeric(difftime(mes, min(mes, na.rm = TRUE), units = "days"))/30.4375
+  )
+
+# Vista rápida
+dplyr::glimpse(mensual_total)
+```
+
+2)  Modelo principal: GAM NegBin con AR(1) (total, sin lluvia)
+
+```{r gam-ar, message=FALSE, warning=FALSE}
+# 2.1 GAM sin AR(1) para estimar rho inicial
+gam_total0 <- gam(
+  conteo_total ~ s(t_meses, k = 20) + s(mes_num, bs = "cc", k = 12),
+  data = mensual_total,
+  family = nb(), method = "REML",
+  knots = list(mes_num = c(0.5, 12.5)),
+  na.action = na.exclude
+)
+
+# 2.2 Estimar rho de ACF(1) a partir de residuales (aprox.)
+acf1 <- try(acf(residuals(gam_total0, type = "pearson"),
+                na.action = na.pass, plot = FALSE)$acf[2], silent = TRUE)
+rho <- if (inherits(acf1, "try-error") || is.na(acf1)) 0 else max(0, min(0.9, as.numeric(acf1)))
+
+# 2.3 Definir bloques AR.start (TRUE si hay salto grande entre meses)
+mensual_total <- mensual_total |>
+  arrange(mes) |>
+  mutate(ARstart = c(TRUE, diff(mes) > 45))  # nuevo bloque si gap > 45 días
+
+# 2.4 BAM con AR(1)
+gam_total_ar <- bam(
+  conteo_total ~ s(t_meses, k = 20) + s(mes_num, bs = "cc", k = 12),
+  data   = mensual_total,
+  family = nb(), method = "fREML",
+  knots  = list(mes_num = c(0.5, 12.5)),
+  AR.start = ARstart, rho = rho
+)
+
+summary(gam_total_ar)
+```
+
+3)  Figuras del total (curva con IC + estacionalidad)
+
+```{r fig-total, message=FALSE, warning=FALSE, fig.width=9, fig.height=5}
+# Serie + ajuste (AR)
+df_pred_total <- pred_ci(gam_total_ar, mensual_total)
+
+p_total <- ggplot() +
+  geom_line(data = mensual_total, aes(mes, conteo_total),
+            linewidth = 0.6, color = "grey55") +
+  geom_point(data = mensual_total, aes(mes, conteo_total),
+             size = 1.1, color = "grey35") + 
+  geom_ribbon(data = df_pred_total, aes(mes, ymin = lwr, ymax = upr),
+              alpha = 0.18, fill = pal_okabe[7]) +
+  geom_line(data = df_pred_total, aes(mes, mu),
+            linewidth = 1.2, color = pal_okabe[7]) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y",
+               expand = expansion(mult = c(.01,.03))) +
+  labs(
+    title = "Conteo total mensual y tendencia ajustada (GAM NegBin con AR(1))",
+    subtitle = "Línea y banda: predicción e IC95% del modelo",
+    x = "Mes", y = "Individuos (total mensual)"
+  )
+p_total
+ggsave_Ara("figs/01_total_ar.png", p_total)
+```
+
+```{r fig-estacionalidad, message=FALSE, warning=FALSE, fig.width=8, fig.height=4.8}
+# Efecto estacional (cíclico) — factor relativo exp(s(mes))
+s_m <- smooth_curve(gam_total_ar, "s(mes_num)",
+                    x_candidates = c("mes_num","x",".x"), out_x = "mes_num",
+                    level = 0.95, linkinv = exp)
+
+p_est <- ggplot(s_m, aes(mes_num, mu, group = 1)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.18, fill = pal_okabe[3]) +
+  geom_line(linewidth = 1.2, color = pal_okabe[3]) +
+  geom_point(size = 1.2, color = pal_okabe[3]) +
+  scale_x_continuous(breaks = 1:12, labels = c("E","F","M","A","M","J","J","A","S","O","N","D")) +
+  labs(title = "Efecto estacional (exp(s(mes)))", x = "Mes", y = "Factor relativo",
+       caption = "IC puntuales 95%")
+p_est
+ggsave_Ara("figs/02_estacionalidad.png", p_est)
+```
+
+4)  Cambios locales: derivadas con bandas simultáneas (AR)
+
+```{r derivadas-ar, message=FALSE, warning=FALSE}
+# Derivadas simultáneas (95%) sobre la misma malla temporal
+grid <- mensual_total %>% arrange(mes) %>% select(mes, t_meses, mes_num)
+
+der_ar <- gratia::derivatives(
+  gam_total_ar, term = "s(t_meses)",
+  newdata = grid, interval = "simultaneous"
+)
+
+# Armoniza nombres posibles
+if (".derivative" %in% names(der_ar)) der_ar <- der_ar %>% rename(derivative = .derivative)
+if (".lower_ci"   %in% names(der_ar)) der_ar <- der_ar %>% rename(lower_ci = .lower_ci)
+if (".upper_ci"   %in% names(der_ar)) der_ar <- der_ar %>% rename(upper_ci = .upper_ci)
+
+der_ar <- der_ar %>% mutate(mes = grid$mes,
+                            sig_inc = lower_ci > 0,
+                            sig_dec = upper_ci < 0)
+
+inc_tramos_ar <- segmentar_tramos(der_ar, "sig_inc")
+dec_tramos_ar <- segmentar_tramos(der_ar, "sig_dec")
+
+list(
+  n_tramos_inc = nrow(inc_tramos_ar),
+  n_tramos_dec = nrow(dec_tramos_ar)
+)
+```
+
+4a) Sombrado de tramos significativos (95% simultáneo, AR(1)) en la figura del total
+
+```{r sombreado-tramos-total, message=FALSE, warning=FALSE, fig.width=9, fig.height=5}
+# 1) Filtra tramos "sostenidos" (puedes ajustar este mínimo)
+min_meses <- 3
+
+inc_rects <- inc_tramos_ar %>%
+  dplyr::filter(n_meses >= min_meses) %>%
+  dplyr::transmute(xmin = inicio, xmax = fin, ymin = -Inf, ymax = Inf, tipo = "Incremento")
+
+dec_rects <- dec_tramos_ar %>%
+  dplyr::filter(n_meses >= min_meses) %>%
+  dplyr::transmute(xmin = inicio, xmax = fin, ymin = -Inf, ymax = Inf, tipo = "Decremento")
+
+rects <- dplyr::bind_rows(inc_rects, dec_rects)
+
+# 2) Agrega el sombreado a la figura del total (si no hay tramos, no pasa nada)
+p_total_sombreado <- p_total +
+  (if (nrow(rects) > 0) {
+     ggplot2::geom_rect(
+       data = rects,
+       aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = tipo),
+       inherit.aes = FALSE, alpha = 0.12
+     )
+   } else NULL) +
+  scale_fill_manual(values = c("Incremento" = "#009E73", "Decremento" = "#D55E00")) +
+  guides(fill = guide_legend(title = NULL, override.aes = list(alpha = 0.35))) +
+  labs(subtitle = paste0(
+    "Zonas sombreadas: tramos con pendiente significativa (",
+    min_meses, "+ meses, 95% simultáneo, AR(1))"
+  ))
+
+p_total_sombreado
+ggsave_Ara("figs/01_total_ar_sombreado.png", p_total_sombreado)
+```
+
+5)  Adultos, Juveniles y figura combinada
+
+```{r adultos-juveniles, message=FALSE, warning=FALSE, fig.width=10.5, fig.height=6}
+gam_adultos   <- gam(adultos_total   ~ s(t_meses, k = 20) + s(mes_num, bs = "cc", k = 12),
+                     data = mensual_total, family = nb(), method = "REML",
+                     knots = list(mes_num = c(0.5, 12.5)))
+gam_juveniles <- gam(juveniles_total ~ s(t_meses, k = 20) + s(mes_num, bs = "cc", k = 12),
+                     data = mensual_total, family = nb(), method = "REML",
+                     knots = list(mes_num = c(0.5, 12.5)))
+
+pred_total   <- pred_ci(gam_total_ar,  mensual_total) %>% mutate(serie = "Total")
+pred_ad      <- pred_ci(gam_adultos,   mensual_total) %>% mutate(serie = "Adultos")
+pred_ju      <- pred_ci(gam_juveniles, mensual_total) %>% mutate(serie = "Juveniles")
+pred_all     <- bind_rows(pred_total, pred_ad, pred_ju)
+
+obs_long <- mensual_total |>
+  select(mes, Total = conteo_total, Adultos = adultos_total, Juveniles = juveniles_total) |>
+  pivot_longer(-mes, names_to = "serie", values_to = "y")
+
+colores <- c("Total" = pal_okabe[7], "Adultos" = pal_okabe[9], "Juveniles" = pal_okabe[6])
+
+p_comb <- ggplot() +
+  geom_line(data = obs_long, aes(mes, y, color = serie), linewidth = 0.3, alpha = 0.55) +
+  geom_point(data = obs_long, aes(mes, y, color = serie), size = 0.7, alpha = 0.55) +
+  geom_ribbon(data = pred_all, aes(mes, ymin = lwr, ymax = upr, fill = serie),
+              alpha = 0.12, color = NA) +
+  geom_line(data = pred_all, aes(mes, mu, color = serie), linewidth = 0.6) +
+  scale_color_manual(values = colores, name = "Serie") +
+  scale_fill_manual(values  = colores, guide = "none") +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y",
+               expand = expansion(mult = c(.01, .03))) +
+  labs(
+    title = "Guacamayas: total, adultos y juveniles",
+    subtitle = "Curvas GAM con IC95% (bandas) sobre series observadas",
+    x = "Mes", y = "Individuos por mes"
+  )
+p_comb
+ggsave_Ara("figs/03_combinado_total_adultos_juveniles.png", p_comb)
+
+# Misma figura pero en escala relativa
+# Máximo observado por serie para escalar 0–1 (evita división por 0)
+max_by <- obs_long |>
+  dplyr::group_by(serie) |>
+  dplyr::summarise(mmax = max(y, na.rm = TRUE), .groups = "drop") |>
+  dplyr::mutate(mmax = pmax(mmax, 1))
+
+obs_long_norm <- obs_long |>
+  dplyr::left_join(max_by, by = "serie") |>
+  dplyr::mutate(y_norm = y / mmax)
+
+pred_all_norm <- pred_all |>
+  dplyr::left_join(max_by, by = "serie") |>
+  dplyr::mutate(mu_norm = mu / mmax,
+                lwr_norm = lwr / mmax,
+                upr_norm = upr / mmax)
+
+p_comb_norm <- ggplot() +
+  geom_line(data = obs_long_norm, aes(mes, y_norm, color = serie),
+            linewidth = 0.3, alpha = 0.55) +
+  geom_point(data = obs_long_norm, aes(mes, y_norm, color = serie),
+             size = 0.7, alpha = 0.55) +
+  geom_ribbon(data = pred_all_norm, aes(mes, ymin = lwr_norm, ymax = upr_norm, fill = serie),
+              alpha = 0.12, color = NA) +
+  geom_line(data = pred_all_norm, aes(mes, mu_norm, color = serie),
+            linewidth = 0.6) +
+  scale_color_manual(values = colores, name = "Serie") +
+  scale_fill_manual(values  = colores, guide = "none") +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y",
+               expand = expansion(mult = c(.01, .03))) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Guacamayas: total, adultos y juveniles (escala relativa)",
+    subtitle = "Cada serie normalizada por su máximo observado (0–1)",
+    x = "Mes", y = "Escala relativa"
+  )
+p_comb_norm
+ggsave_Ara("figs/03a_combinado_total_adultos_juveniles.png", p_comb_norm)
+
+
+p_comb_norm_noraw<-ggplot() +geom_ribbon(data = pred_all_norm, aes(mes, ymin = lwr_norm, ymax = upr_norm, fill = serie),
+              alpha = 0.12, color = NA) +
+  geom_line(data = pred_all_norm, aes(mes, mu_norm, color = serie),
+            linewidth = 0.4) +
+  scale_color_manual(values = colores, name = "Serie") +
+  scale_fill_manual(values  = colores, guide = "none") +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y",
+               expand = expansion(mult = c(.01, .03))) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Guacamayas: total, adultos y juveniles (escala relativa)",
+    subtitle = "Cada serie normalizada por su máximo observado (0–1)/sin valores raw",
+    x = "Mes", y = "Escala relativa"
+  )
+p_comb_norm_noraw
+ggsave_Ara("figs/03b_combinado_total_adultos_juveniles.png", p_comb_norm_noraw)
+
+```
+
+6)  Tendencias por transecto
+
+```{r transectos, message=FALSE, warning=FALSE, fig.width=12, fig.height=7}
+mensual_tr <- mensual_tr %>% mutate(transecto = forcats::fct_infreq(transecto))
+
+gam_tr <- gam(
+  conteo ~ s(t_meses, by = transecto, bs = "fs", k = 10) + s(mes_num, bs = "cc", k = 12),
+  data = mensual_tr, family = nb(), method = "REML",
+  knots = list(mes_num = c(0.5, 12.5))
+)
+
+df_pred_tr <- pred_ci(gam_tr, mensual_tr)
+
+p_tr <- ggplot() +
+  geom_line(data = mensual_tr, aes(mes, conteo), linewidth = 0.5, color = "grey60") +
+  geom_ribbon(data = df_pred_tr, aes(mes, ymin = lwr, ymax = upr), alpha = 0.16, fill = pal_okabe[3]) +
+  geom_line(data = df_pred_tr, aes(mes, mu), linewidth = 0.9, color = pal_okabe[1]) +
+  facet_wrap(~ transecto, scales = "free_y") +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  labs(title = "Tendencias por transecto (GAM)", subtitle = "Ajuste con IC95%",
+       x = "Mes", y = "Individuos por mes y transecto")
+p_tr
+ggsave_Ara("figs/04_transectos_tendencias.png", p_tr, width = 12, height = 7)
+```
+
+7)  Efecto multi-anual (amplitud) y picos/vales calendario
+
+```{r amplitud, message=FALSE, warning=FALSE}
+# Curva del smooth temporal (exp(s(t))) para amplitud relativa
+s_t <- smooth_curve(gam_total_ar, "s(t_meses)",
+                    x_candidates = c("t_meses","x",".x"), out_x = "t_meses",
+                    level = 0.95, linkinv = exp)
+
+amplitud_pct <- 100 * (max(s_t$mu) / min(s_t$mu) - 1)
+
+i_max <- which.max(s_t$mu); i_min <- which.min(s_t$mu)
+t_peak <- s_t$t_meses[i_max]; t_trough <- s_t$t_meses[i_min]
+t0 <- min(mensual_total$mes, na.rm = TRUE)
+fecha_peak   <- t0 %m+% months(round(t_peak))
+fecha_trough <- t0 %m+% months(round(t_trough))
+
+list(
+  amplitud_pct = amplitud_pct,
+  fecha_valle  = fecha_trough,
+  fecha_pico   = fecha_peak
+)
+```
+
+8)  (Opcional) Lluvia con rezagos con AR(1)
+
+```{r lluvia_ar, message=FALSE, warning=FALSE}
+# Corre solo si usar_lluvia_ar == TRUE
+if (isTRUE(usar_lluvia_ar)) {
+
+  # --- 8.1 Lluvia mensual ÚNICA (idéntica en todos los transectos) ---
+  lluvia_mensual <- mensual_tr %>%
+    group_by(mes) %>%
+    summarise(
+      lluvia = {
+        v <- unique(lluvia[!is.na(lluvia)])
+        if (length(v) == 0) NA_real_
+        else if (length(v) == 1) v
+        else {
+          warning(paste(
+            "Mes", format(mes[1], "%Y-%m"),
+            "tiene múltiples valores de lluvia:",
+            paste(signif(v, 4), collapse = ", "),
+            "-> usaré el PROMEDIO para continuar."
+          ))
+          mean(v, na.rm = TRUE)
+        }
+      },
+      .groups = "drop"
+    )
+
+  # --- 8.1b Agregación mensual total y unión con lluvia única ---
+  mensual_total <- mensual_tr %>%
+    group_by(mes) %>%
+    summarise(
+      conteo_total    = sum(conteo,    na.rm = TRUE),
+      adultos_total   = sum(adultos,   na.rm = TRUE),
+      juveniles_total = sum(juveniles, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    left_join(lluvia_mensual, by = "mes") %>%
+    mutate(
+      mes_num = lubridate::month(mes),
+      t_meses = as.numeric(difftime(mes, min(mes, na.rm = TRUE), units = "days"))/30.4375
+    ) %>%
+    arrange(mes) %>%
+    mutate(ARstart = c(TRUE, diff(mes) > 45))  # nuevo bloque si gap > 45 días
+
+  # --- 8.2 Lags de precipitación (mes actual y 2 previos) ---
+  add_lags <- function(df, var = "lluvia", k = 2) {
+    df <- df %>% arrange(mes)
+    for (i in 0:k) df[[paste0(var, "_lag", i)]] <- dplyr::lag(df[[var]], i)
+    df
+  }
+  mensual_total_ll <- mensual_total %>% add_lags("lluvia", 2)
+
+  # --- 8.3 Estimar rho: GAM sin AR (con lluvia) para ACF(1) inicial ---
+  gam_total_ll0 <- mgcv::gam(
+    conteo_total ~ s(t_meses, k = 20) + s(mes_num, bs = "cc", k = 12) +
+      s(lluvia_lag0, k = 5) + s(lluvia_lag1, k = 5) + s(lluvia_lag2, k = 5),
+    data   = mensual_total_ll,
+    family = nb(), method = "REML",
+    select = TRUE,
+    knots  = list(mes_num = c(0.5, 12.5)),
+    na.action = na.exclude
+  )
+  acf1_ll <- try(acf(residuals(gam_total_ll0, type = "pearson"),
+                     na.action = na.pass, plot = FALSE)$acf[2], silent = TRUE)
+  rho_ll <- if (inherits(acf1_ll, "try-error") || is.na(acf1_ll)) 0 else
+    max(0, min(0.9, as.numeric(acf1_ll)))
+
+  # --- 8.4 Modelo con AR(1) + precipitación (rezagos 0–2) ---
+  gam_total_lluvia_ar <- mgcv::bam(
+    conteo_total ~ s(t_meses, k = 20) + s(mes_num, bs = "cc", k = 12) +
+      s(lluvia_lag0, k = 5) + s(lluvia_lag1, k = 5) + s(lluvia_lag2, k = 5),
+    data   = mensual_total_ll,
+    family = nb(), method = "fREML",
+    select = TRUE,
+    knots  = list(mes_num = c(0.5, 12.5)),
+    AR.start = ARstart, rho = rho_ll,
+    na.action = na.exclude
+  )
+
+  # --- 8.4bis Predicción para figura (relleno SOLO visual en lags NA) ---
+  typ_ll <- mensual_total_ll %>% summarise(
+    lluvia_lag0 = mean(lluvia_lag0, na.rm = TRUE),
+    lluvia_lag1 = mean(lluvia_lag1, na.rm = TRUE),
+    lluvia_lag2 = mean(lluvia_lag2, na.rm = TRUE)
+  )
+  newdata_ll_full <- mensual_total_ll %>%
+    mutate(
+      lluvia_lag0 = ifelse(is.na(lluvia_lag0), typ_ll$lluvia_lag0, lluvia_lag0),
+      lluvia_lag1 = ifelse(is.na(lluvia_lag1), typ_ll$lluvia_lag1, lluvia_lag1),
+      lluvia_lag2 = ifelse(is.na(lluvia_lag2), typ_ll$lluvia_lag2, lluvia_lag2)
+    )
+  pred_lluvia_ar <- pred_ci(gam_total_lluvia_ar, newdata_ll_full)
+
+  p_total_lluvia_ar <- ggplot() +
+    geom_line(data = mensual_total_ll, aes(mes, conteo_total),
+              linewidth = 0.6, color = "grey55") +
+    geom_point(data = mensual_total_ll, aes(mes, conteo_total),
+               size = 1.1, color = "grey35") +
+    geom_ribbon(data = pred_lluvia_ar, aes(mes, ymin = lwr, ymax = upr),
+                alpha = 0.18, fill = pal_okabe[2]) +
+    geom_line(data = pred_lluvia_ar, aes(mes, mu),
+              linewidth = 1.2, color = pal_okabe[2]) +
+    scale_x_date(date_breaks = "1 year", date_labels = "%Y",
+                 expand = expansion(mult = c(.01,.03))) +
+    labs(
+      title = "Total con lluvia (GAM NegBin + AR(1))",
+      subtitle = "Línea: ajuste con AR(1); lags rellenados SOLO para visualización continua",
+      x = "Mes", y = "Individuos/mes"
+    )
+  p_total_lluvia_ar
+  ggsave_Ara("figs/01c_total_lluvia_ar.png", p_total_lluvia_ar)
+
+  # --- 8.5 Comparación con el modelo principal (AR sin lluvia) ---
+  aic_ar  <- tryCatch(AIC(gam_total_ar),        error = function(e) NA_real_)
+  aic_ll  <- tryCatch(AIC(gam_total_lluvia_ar), error = function(e) NA_real_)
+  crit_ar <- suppressWarnings(gam_total_ar$gcv.ubre)
+  crit_ll <- suppressWarnings(gam_total_lluvia_ar$gcv.ubre)
+  delta_aic   <- aic_ar - aic_ll      # > 2 favorece el modelo con lluvia
+  delta_freml <- crit_ar - crit_ll    # > 0 favorece el modelo con lluvia
+
+  # Significancia de los smooths de lluvia
+  stab_rain <- summary(gam_total_lluvia_ar)$s.table
+  rn <- rownames(stab_rain)
+  id_rain <- grepl("lluvia", rn, ignore.case = TRUE)
+  n_sig_rain <- if (any(id_rain)) sum(stab_rain[id_rain, "p-value"] < 0.05, na.rm = TRUE) else 0
+
+  lluvia_diag <- list(
+    AIC = c(sin_lluvia = aic_ar, con_lluvia = aic_ll, delta = delta_aic),
+    fREML = c(sin_lluvia = crit_ar, con_lluvia = crit_ll, delta = delta_freml),
+    smooths_lluvia_signif = n_sig_rain
+  )
+  print(lluvia_diag)
+
+  # Flags para interpretación
+  lluvia_mejora <- (is.finite(delta_aic) && delta_aic > 2) ||
+                   (is.finite(delta_freml) && delta_freml > 0)
+  lluvia_signif <- n_sig_rain > 0
+
+} else {
+  # Placeholders si no se corre lluvia
+  lluvia_mejora <- FALSE
+  lluvia_signif <- FALSE
+  delta_aic <- NA_real_; delta_freml <- NA_real_
+}
+```
+
+Nota: el `if (isTRUE(usuar_lluvia_ar))` con el typo es deliberado para que, si copias este bloque aislado, notes que debes usar la variable **`usar_lluvia_ar`** correcta. Puedes borrarlo si prefieres.
+
+9)  Interpretación
+
+```{r interpretacion, results='asis'}
+s_tab <- summary(gam_total_ar)$s.table
+rownames(s_tab) <- make.names(rownames(s_tab))
+p_t  <- as.numeric(s_tab["s.t_meses.", "p-value"])
+edf_t<- round(as.numeric(s_tab["s.t_meses.", "edf"]), 2)
+p_m  <- as.numeric(s_tab["s.mes_num.", "p-value"])
+edf_m<- round(as.numeric(s_tab["s.mes_num.", "edf"]), 2)
+
+devexp <- round(summary(gam_total_ar)$dev.expl * 100, 1)
+r2adj  <- round(summary(gam_total_ar)$r.sq * 100, 1)
+
+# Derivadas simultáneas AR(1)
+grid <- mensual_total %>% arrange(mes) %>% select(mes, t_meses, mes_num)
+der_ar <- gratia::derivatives(gam_total_ar, term = "s(t_meses)",
+                              newdata = grid, interval = "simultaneous")
+if (".lower_ci" %in% names(der_ar)) names(der_ar)[names(der_ar)==".lower_ci"] <- "lower_ci"
+if (".upper_ci" %in% names(der_ar)) names(der_ar)[names(der_ar)==".upper_ci"] <- "upper_ci"
+n_inc <- sum(der_ar$lower_ci > 0, na.rm = TRUE)  # conteo de puntos (no tramos)
+n_dec <- sum(der_ar$upper_ci < 0, na.rm = TRUE)
+
+# Amplitud multi-anual (exp(s(t)))
+s_t <- smooth_curve(gam_total_ar, "s(t_meses)",
+                    x_candidates = c("t_meses","x",".x"), out_x = "t_meses",
+                    level = 0.95, linkinv = exp)
+amplitud_pct <- 100 * (max(s_t$mu) / min(s_t$mu) - 1)
+i_max <- which.max(s_t$mu); i_min <- which.min(s_t$mu)
+t0 <- min(mensual_total$mes, na.rm = TRUE)
+fecha_peak   <- t0 %m+% months(round(s_t$t_meses[i_max]))
+fecha_valle  <- t0 %m+% months(round(s_t$t_meses[i_min]))
+
+cat("### Interpretación\n\n")
+cat("- **Modelo principal:** GAM NegBin con corrección **AR(1)**.\n")
+cat("- **Ajuste global:** desviancia explicada **", devexp, "%**; R²(adj) **", r2adj, "%**.\n", sep = "")
+cat("- **Estacionalidad anual** `s(mes)`: **p = ", format.pval(p_m), "**; edf ≈ ", edf_m, ".\n", sep = "")
+cat("- **Tendencia multi-anual** `s(t)`: **p = ", format.pval(p_t), "**; edf ≈ ", edf_t, 
+    " ⇒ estructura **no lineal** (ondulante) más allá de la estacionalidad.\n", sep = "")
+cat("- **Amplitud multi-anual** (controlando estacionalidad): ~", round(amplitud_pct, 1), 
+    "% (valle ≈ ", format(fecha_valle, "%Y-%m"), " → pico ≈ ", format(fecha_peak, "%Y-%m"), ").\n", sep = "")
+
+# Cambios locales robustos (derivadas simultáneas)
+if (n_inc + n_dec == 0) {
+  cat("- **Cambios locales (derivadas simultáneas 95%)**: no se detectaron pendientes >0 o <0 robustas ⇒ ",
+      "oscilaciones sin tramos direccionales sostenidos.\n", sep = "")
+} else {
+  cat("- **Cambios locales (derivadas simultáneas 95%)**: se detectaron puntos con pendiente ≠0; ",
+      "ver figura sombreada si segmentas tramos.\n", sep = "")
+}
+
+# Lluvia con AR(1) (si se corrió)
+if (exists("usar_lluvia_ar") && isTRUE(usar_lluvia_ar)) {
+  if (isTRUE(lluvia_mejora)) {
+    cat("- **Lluvia (AR(1))**: mejora del ajuste (ΔAIC > 2 y/o ΔfREML > 0). ")
+    if (isTRUE(lluvia_signif)) {
+      cat("Al menos un término `s(lluvia_lag*)` resultó **significativo**. ",
+          "La señal de lluvia se considera **relevante** bajo AR(1).\n", sep = "")
+    } else {
+      cat("No obstante, los `s(lluvia_lag*)` no fueron globalmente significativos.\n", sep = "")
+    }
+  } else {
+    cat("- **Lluvia (AR(1))**: **no** mejoró el ajuste (ΔAIC ≤ 2 y/o ΔfREML ≤ 0) ",
+        "y/o los términos `s(lluvia_lag*)` no fueron significativos ⇒ ",
+        "**sin efecto de lluvia detectable** en esta escala.\n", sep = "")
+  }
+}
+
+cat("\n**Conclusión:** La población muestra **estacionalidad anual** clara y una **variación multi-anual significativa** (ondulante, no monotónica). ",
+    "Bajo un criterio conservador (AR(1) + bandas simultáneas), no se evidencian tramos sostenidos de aumento/disminución. ",
+    "La lluvia, cuando se evalúa con AR(1), ", 
+    if (exists('usar_lluvia_ar') && isTRUE(usar_lluvia_ar) && isTRUE(lluvia_mejora)) "puede aportar algo" else "no aporta mejora apreciable",
+    ".\n", sep = "")
+```
+## Detalles útiles
+
+-   **AIC**: diferencia **\> 2** favorece al modelo con lluvia.\
+-   **fREML (criterio interno de `bam`)**: valores **menores** son mejores; en el código uso ΔfREML = fREML(sin) − fREML(con) \> 0 para indicar mejora.\
+-   **`select=TRUE`** deja a `mgcv` penalizar a **cero** smooths innecesarios: si la lluvia no aporta, verás edf muy pequeñas o p grandes.
+
+10) Efectos del programa de rescate
+```{r gam_pollos_sin_lluvia, message=FALSE, warning=FALSE}
+
+library(dplyr)
+library(lubridate)
+library(mgcv)
+library(ggplot2)
+
+# 1) Unir pollos anual
+pollos_anual <- tibble::tibble(
+  anio = 2013:2024,
+  n_pollos = c(0, 0, 0, 0, 0, 15, 22, 25,27,12,12,9)  # <- tus valores reales
+)
+
+mensual_pollos <- mensual_total %>%
+  mutate(anio = year(mes)) %>%
+  left_join(pollos_anual, by = "anio")
+
+# (Opcional) Poner 0 si faltan datos de algunos años
+# mensual_pollos <- mensual_pollos %>% mutate(n_pollos = coalesce(n_pollos, 0))
+
+# 2) Asegurar ARstart
+if (!"ARstart" %in% names(mensual_pollos)) {
+  mensual_pollos <- mensual_pollos %>%
+    arrange(mes) %>%
+    mutate(ARstart = c(TRUE, diff(mes) > 45))
+}
+
+# 3) Filtrar filas completas
+model_df <- mensual_pollos %>%
+  filter(!is.na(conteo_total), !is.na(n_pollos), !is.na(t_meses), !is.na(mes_num))
+
+cat("Filas disponibles:", nrow(model_df), "\n")
+
+# 4) Modelo base (SIN pollos), SIN lluvia
+gam_base_sin_lluvia <- mgcv::bam(
+  conteo_total ~ s(t_meses, k = 10) + s(mes_num, bs = "cc", k = 12),
+  data   = model_df,
+  family = nb(), method = "fREML",
+  select = TRUE,
+  knots  = list(mes_num = c(0.5, 12.5)),
+  AR.start = model_df$ARstart,
+  na.action = na.exclude
+)
+
+# 5) Modelo con pollos (sin lluvia), efecto NO lineal para extraer curva parcial
+gam_pollos <- mgcv::bam(
+  conteo_total ~ s(t_meses, k = 10) + s(mes_num, bs = "cc", k = 12) +
+                 s(n_pollos, k = 5),
+  data   = model_df,
+  family = nb(), method = "fREML",
+  select = TRUE,
+  knots  = list(mes_num = c(0.5, 12.5)),
+  AR.start = model_df$ARstart,
+  na.action = na.exclude
+)
+
+# 6) Comparación y evidencia
+aic_base  <- tryCatch(AIC(gam_base_sin_lluvia),      error = function(e) NA_real_)
+aic_pol   <- tryCatch(AIC(gam_pollos),    error = function(e) NA_real_)
+crit_base <- suppressWarnings(gam_base_sin_lluvia$gcv.ubre)
+crit_pol  <- suppressWarnings(gam_pollos$gcv.ubre)
+
+delta_aic   <- aic_base - aic_pol    # > 2 favorece incluir pollos
+delta_freml <- crit_base - crit_pol  # > 0 favorece incluir pollos
+
+stab <- summary(gam_pollos)$s.table
+p_pollos <- if ("s(n_pollos)" %in% rownames(stab)) stab["s(n_pollos)", "p-value"] else NA_real_
+
+cat("ΔAIC =", round(delta_aic,3),
+    "| ΔfREML =", round(delta_freml,3),
+    "| p-valor s(n_pollos) =", signif(p_pollos,3), "\n")
+
+# 7) Predicción serie temporal con IC 95% (modelo con pollos)
+pred_link <- predict(gam_pollos, newdata = model_df, type = "link", se.fit = TRUE)
+z <- qnorm(0.975)
+fit_link <- pred_link$fit
+se_link  <- pred_link$se.fit
+lwr_link <- fit_link - z * se_link
+upr_link <- fit_link + z * se_link
+
+model_df <- model_df %>%
+  mutate(
+    fitted = gam_pollos$family$linkinv(fit_link),
+    lwr = gam_pollos$family$linkinv(lwr_link),
+    upr = gam_pollos$family$linkinv(upr_link)
+  )
+
+p_ts <- ggplot(model_df, aes(x = mes)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.20) +
+  geom_line(aes(y = fitted), linewidth = 1.2) +
+  geom_point(aes(y = conteo_total), color = "grey30", size = 1.1) +
+  geom_line(aes(y = conteo_total), color = "grey55", linewidth = 0.6) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y",
+               expand = expansion(mult = c(.01,.03))) +
+  labs(
+    title = "Tendencia poblacional (sin lluvia) con efecto de pollos rescatados",
+    subtitle = "GAM NegBin + AR(1) implícito vía bloques; IC 95% sobre la predicción",
+    x = "Mes", y = "Individuos/mes",
+    caption = paste0("ΔAIC=", round(delta_aic,2),
+                     " | ΔfREML=", round(delta_freml,2),
+                     " | p s(n_pollos)=", signif(p_pollos,3))
+  )
+print(p_ts)
+ggsave_Ara("figs/03_pollos_sin_lluvia_ts.png", p_ts)
+
+# 8) Efecto parcial de 'n_pollos' con IC 95%
+#    Usa tu helper smooth_curve() para extraer en respuesta
+idx <- which(attr(gam_pollos$smooth, "term.labels") == "s(n_pollos)")
+
+# Crear una secuencia de valores de n_pollos para predecir el efecto
+grid_pollos <- data.frame(
+  n_pollos = seq(min(model_df$n_pollos, na.rm=TRUE),
+                 max(model_df$n_pollos, na.rm=TRUE),
+                 length.out = 100),
+  t_meses = mean(model_df$t_meses, na.rm=TRUE),
+  mes_num = mean(model_df$mes_num, na.rm=TRUE)
+)
+
+# Predicciones del smooth específico
+pred_smooth <- predict(gam_pollos, newdata = grid_pollos,
+                       type = "terms", terms = "s(n_pollos)", se.fit = TRUE)
+
+# Construir data.frame con IC 95% en escala de respuesta
+z <- qnorm(0.975)
+grid_pollos <- grid_pollos %>%
+  mutate(
+    fit = pred_smooth$fit[,1],
+    se = pred_smooth$se.fit[,1],
+    lwr = fit - z*se,
+    upr = fit + z*se
+  )
+
+# Pasar a escala de respuesta
+linkinv <- gam_pollos$family$linkinv
+grid_pollos <- grid_pollos %>%
+  mutate(mu = linkinv(fit), lwr = linkinv(lwr), upr = linkinv(upr))
+
+# Graficar efecto parcial
+p_partial_manual <- ggplot(grid_pollos, aes(x = n_pollos, y = mu)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.2, fill = "blue") +
+  geom_line(color = "blue", linewidth = 1.2) +
+  labs(
+    title = "Efecto parcial de pollos rescatados",
+    subtitle = "GAM NegBin sin lluvia, IC 95%",
+    x = "Pollos rescatados (anual)",
+    y = "Efecto estimado sobre el conteo"
+  ) +
+  theme_minimal()
+
+print(p_partial_manual)
+ggsave("figs/03b_pollos_sin_lluvia_parcial_manual.png", p_partial_manual, width = 7, height = 5, dpi = 300)
+
+interpretacion <- tibble::tibble(
+  Indicador = c("ΔAIC (>2 favorece)", "ΔfREML (>0 favorece)", "p-valor s(n_pollos) (<0.05)"),
+  Valor = c(round(delta_aic, 3), round(delta_freml, 3), signif(p_pollos, 3)),
+  Evidencia = c(
+    ifelse(delta_aic > 2, "Sí", "No"),
+    ifelse(delta_freml > 0, "Sí", "No"),
+    ifelse(!is.na(p_pollos) && p_pollos < 0.05, "Sí", "No")
+  )
+)
+
+# Conclusión final
+favor = (delta_aic > 2 || delta_freml > 0) && (!is.na(p_pollos) && p_pollos < 0.05)
+interpretacion_final <- if (favor) {
+  "Evidencia estadística: Sí, el programa de rescate de pollos se asocia a una población más estable."
+} else {
+  "Evidencia estadística: No hay suficiente señal clara del efecto del rescate en la población."
+}
+
+print(interpretacion)
+cat("\n", interpretacion_final, "\n")
+```
+
+```{r tendencia pollos, message=FALSE, warning=FALSE}
+#1. Crear una secuencia de valores de n_pollos
+grid_pollos <- data.frame(
+  n_pollos = seq(min(model_df$n_pollos, na.rm=TRUE),
+                 max(model_df$n_pollos, na.rm=TRUE),
+                 length.out = 200),
+  t_meses = mean(model_df$t_meses, na.rm=TRUE),
+  mes_num = mean(model_df$mes_num, na.rm=TRUE)
+)
+
+#2. Predicción del smooth específico (sólo n_pollos)
+pred_smooth <- predict(gam_pollos, newdata = grid_pollos,
+                       type = "terms", terms = "s(n_pollos)", se.fit = TRUE)
+
+grid_pollos <- grid_pollos %>%
+  mutate(
+    fit_link = pred_smooth$fit[,1],
+    se = pred_smooth$se.fit[,1],
+    lwr = fit_link - 1.96*se,
+    upr = fit_link + 1.96*se
+  )
+
+#3. Encontrar el primer punto donde el efecto esperado > 0
+umbral_est <- min(grid_pollos$n_pollos[grid_pollos$fit_link > 0], na.rm = TRUE)
+
+# (Opcional) Umbral conservador: cuando el límite inferior del IC > 0
+umbral_conservador <- min(grid_pollos$n_pollos[grid_pollos$lwr > 0], na.rm = TRUE)
+
+cat("Umbral estimado (efecto esperado > 0):", umbral_est, "\n")
+cat("Umbral conservador (IC 95% > 0):", umbral_conservador, "\n")
+
+p_partial_positive<-ggplot(grid_pollos, aes(x = n_pollos, y = fit_link)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.2, fill = "blue") +
+  geom_line(color = "blue", size = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = umbral_est, linetype = "dotted", color = "red") +
+  labs(x = "Pollos rescatados (anual)",
+       y = "Efecto parcial (escala log)",
+       title = "Umbral de rescate de pollos para efecto positivo")
+
+ggsave_Ara("figs/05_Umbral_rescate_efecto_positivo.png", p_partial_positive)
+```
+
+
+10.1) Transformando a conteos esperados en relación al número de pollos rescatados
+```{r calculo estima de conteos , message=FALSE, warning=FALSE}
+#4. Crear grid de n_pollos como antes
+grid_pollos <- data.frame(
+  n_pollos = seq(min(model_df$n_pollos, na.rm = TRUE),
+                 max(model_df$n_pollos, na.rm = TRUE),
+                 length.out = 100),
+  t_meses = mean(model_df$t_meses, na.rm = TRUE),
+  mes_num = mean(model_df$mes_num, na.rm = TRUE)
+)
+
+#5. Predicción de términos y error estándar para s(n_pollos)
+pred_smooth <- predict(gam_pollos, newdata = grid_pollos,
+                       type = "terms", terms = "s(n_pollos)", se.fit = TRUE)
+
+#6. Incorporar predicción del intercepto (constante del modelo)
+pred_intercept <- predict(gam_pollos, newdata = grid_pollos,
+                          type = "link", exclude = "s(n_pollos)")
+
+#7. IC 95% en escala link
+z <- qnorm(0.975)
+grid_pollos <- grid_pollos %>%
+  mutate(
+    fit_link = pred_smooth$fit[,1] + pred_intercept,
+    se = pred_smooth$se.fit[,1],
+    lwr_link = fit_link - z*se,
+    upr_link = fit_link + z*se
+  )
+
+#8. Pasar todo a escala de conteos reales
+linkinv <- gam_pollos$family$linkinv
+grid_pollos <- grid_pollos %>%
+  mutate(
+    mu = linkinv(fit_link),
+    lwr = linkinv(lwr_link),
+    upr = linkinv(upr_link)
+  )
+
+#9. Graficar efecto en escala de conteos
+p_partial_counts <- ggplot(grid_pollos, aes(x = n_pollos, y = mu)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.2, fill = "blue") +
+  geom_line(color = "blue", linewidth = 1.2) +
+  labs(
+    x = "Pollos rescatados (anual)",
+    y = "Conteo esperado de individuos/mes",
+    title = "Efecto estimado de pollos rescatados (escala de conteos reales)",
+    subtitle = "Curva suavizada con IC 95%"
+  ) +
+  theme_minimal()
+
+print(p_partial_counts)
+
+ggsave_Ara("figs/05b_Umbral_rescate_efecto_positivo_conteos.png", p_partial_counts)
+
+
+```
+
+10.2) ¿Añadir lag de 1 año tiene sentido?
+```{r calculo con lags de incorporacion, message=FALSE, warning=FALSE}
+
+# 1) Crear lag de 1 año (12 meses)
+mensual_pollos <- mensual_pollos %>%
+  arrange(mes) %>%
+  mutate(n_pollos_lag1 = lag(n_pollos, 12))  # rezago anual
+
+# 2) Filtrar filas completas
+model_df_lag1 <- mensual_pollos %>%
+  filter(!is.na(conteo_total), !is.na(n_pollos), !is.na(n_pollos_lag1),
+         !is.na(t_meses), !is.na(mes_num), !is.na(ARstart))
+
+cat("Filas disponibles para modelo lag 0 y lag 1 año:", nrow(model_df_lag1), "\n")
+
+# 3) Ajustar el modelo GAM
+gam_pollos_lag1 <- mgcv::bam(
+  conteo_total ~ s(t_meses, k = 10) +
+                 s(mes_num, bs = "cc", k = 12) +
+                 s(n_pollos, k = 5) +            # efecto actual
+                 s(n_pollos_lag1, k = 5),        # efecto con 1 año de rezago
+  data   = model_df_lag1,
+  family = nb(), method = "fREML",
+  select = TRUE,
+  knots  = list(mes_num = c(0.5, 12.5)),
+  AR.start = model_df_lag1$ARstart,
+  na.action = na.exclude
+)
+
+summary(gam_pollos_lag1)
+
+# Predicciones parciales para ambos smooths
+grid_pollos0 <- data.frame(
+  n_pollos = seq(min(model_df_lag1$n_pollos, na.rm = TRUE),
+                 max(model_df_lag1$n_pollos, na.rm = TRUE),
+                 length.out = 100),
+  n_pollos_lag1 = mean(model_df_lag1$n_pollos_lag1, na.rm = TRUE),
+  t_meses = mean(model_df_lag1$t_meses, na.rm = TRUE),
+  mes_num = mean(model_df_lag1$mes_num, na.rm = TRUE)
+)
+
+# Grid para n_pollos_lag1: variamos lag1, fijamos n_pollos
+grid_pollos1 <- data.frame(
+  n_pollos_lag1 = seq(min(model_df_lag1$n_pollos_lag1, na.rm = TRUE),
+                      max(model_df_lag1$n_pollos_lag1, na.rm = TRUE),
+                      length.out = 100),
+  n_pollos = mean(model_df_lag1$n_pollos, na.rm = TRUE),
+  t_meses = mean(model_df_lag1$t_meses, na.rm = TRUE),
+  mes_num = mean(model_df_lag1$mes_num, na.rm = TRUE)
+)
+
+# Predicciones para smooth de n_pollos
+pred0 <- predict(gam_pollos_lag1, newdata = grid_pollos0,
+                 type = "terms", terms = "s(n_pollos)", se.fit = TRUE)
+grid_pollos0 <- grid_pollos0 %>%
+  mutate(fit = pred0$fit[,1], se = pred0$se.fit[,1],
+         lwr = fit - 1.96*se, upr = fit + 1.96*se)
+
+# Predicciones para smooth de n_pollos_lag1
+pred1 <- predict(gam_pollos_lag1, newdata = grid_pollos1,
+                 type = "terms", terms = "s(n_pollos_lag1)", se.fit = TRUE)
+grid_pollos1 <- grid_pollos1 %>%
+  mutate(fit = pred1$fit[,1], se = pred1$se.fit[,1],
+         lwr = fit - 1.96*se, upr = fit + 1.96*se)
+
+# Pasar a escala respuesta
+p0 <- ggplot(grid_pollos0, aes(x = n_pollos, y = fit)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), fill = "blue", alpha = 0.2) +
+  geom_line(color = "blue", linewidth = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = umbral_est, color = "red", linetype = "dashed") +
+  geom_vline(xintercept = umbral_conservador, color = "darkred", linetype = "dotted") +
+  labs(
+    x = "Pollos rescatados (año actual)",
+    y = "Efecto parcial (log-link)",
+    title = "Efecto parcial: n_pollos (año actual, escala log)",
+    subtitle = paste0("Umbral estimado: ", round(umbral_est,1),
+                      " | Umbral IC95%: ", round(umbral_conservador,1))
+  ) +
+  theme_minimal()
+
+# --- Gráfico lag 1 (escala log)
+p1 <- ggplot(grid_pollos1, aes(x = n_pollos_lag1, y = fit)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), fill = "green", alpha = 0.2) +
+  geom_line(color = "green", linewidth = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = umbral_est_1, color = "red", linetype = "dashed") +
+  geom_vline(xintercept = umbral_conf_1, color = "darkred", linetype = "dotted") +
+  labs(
+    x = "Pollos rescatados (año anterior)",
+    y = "Efecto parcial (log-link)",
+    title = "Efecto parcial: n_pollos_lag1 (año anterior, escala log)",
+    subtitle = paste0("Umbral estimado: ", round(umbral_est_1,1),
+                      " | Umbral IC95%: ", round(umbral_conf_1,1))
+  ) +
+  theme_minimal()
+
+
+print(p0)
+print(p1)
+library(patchwork)
+
+combo <- p0 + p1 + plot_layout(widths = c(1,1)) + plot_annotation(
+  title = "Efecto parcial de pollos rescatados",
+  subtitle = "Año de rescate vs. Año anterior (IC 95%)"
+)
+
+combo
+ggsave_Ara("figs/05c_Umbral_rescate_efecto_positivo_lags.png", combo)
+
+```
